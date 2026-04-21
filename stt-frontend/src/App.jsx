@@ -4,6 +4,7 @@ function App() {
   const [file, setFile] = useState(null)
   const [isLoading, setIsLoading] = useState(false)
   const [result, setResult] = useState(null)
+  const [elapsedSec, setElapsedSec] = useState(0)
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -16,6 +17,7 @@ function App() {
 
     setIsLoading(true)
     setResult(null)
+    setElapsedSec(0)
 
     const formData = new FormData()
     formData.append('audio_file', file)
@@ -41,7 +43,12 @@ function App() {
 
         if (attempts > maxAttempts) {
           clearInterval(intervalId)
-          setResult({ error: "タイムアウトしました。" })
+          setResult({
+            error: "タイムアウトしました。",
+            timing: {
+              elapsed_sec: elapsedSec,
+            },
+          })
           setIsLoading(false)
           return
         }
@@ -50,13 +57,32 @@ function App() {
           const statusRes = await fetch(`${baseUrl}/status/${jobId}`)
           const statusData = await statusRes.json()
 
+          if (typeof statusData.current_elapsed_sec === 'number') {
+            setElapsedSec(statusData.current_elapsed_sec)
+          }
+
           if (statusData.status === 'completed') {
             clearInterval(intervalId)
-            setResult(statusData.result)
+            setResult({
+              ...statusData.result,
+              timing: statusData.result?.timing ?? {
+                elapsed_sec: statusData.elapsed_sec,
+                created_at: statusData.created_at,
+                started_at: statusData.started_at,
+                finished_at: statusData.finished_at,
+              },
+            })
+            setElapsedSec(statusData.elapsed_sec ?? statusData.current_elapsed_sec ?? 0)
             setIsLoading(false)
           } else if (statusData.status === 'error') {
             clearInterval(intervalId)
-            setResult({ error: `サーバーエラー: ${statusData.message}` })
+            setResult({
+              error: `サーバーエラー: ${statusData.message}`,
+              timing: {
+                elapsed_sec: statusData.elapsed_sec,
+              },
+            })
+            setElapsedSec(statusData.elapsed_sec ?? statusData.current_elapsed_sec ?? 0)
             setIsLoading(false)
           }
         } catch (pollError) {
@@ -114,6 +140,12 @@ function App() {
         </button>
       </div>
 
+      {isLoading && (
+        <div style={{ marginTop: '12px', color: '#555', fontSize: '14px' }}>
+          経過時間: {elapsedSec.toFixed(1)} 秒
+        </div>
+      )}
+
       {result && result.cleaned_text && (
         <div
           style={{
@@ -123,7 +155,12 @@ function App() {
             border: '1px solid #e9ecef'
           }}
         >
-          <h3 style={{ marginTop: 0, marginBottom: '16px' }}>整形後テキスト</h3>
+          <h3 style={{ marginTop: 0, marginBottom: '8px' }}>処理結果</h3>
+          {result?.timing?.elapsed_sec != null && (
+            <div style={{ marginBottom: '16px', color: '#666', fontSize: '14px' }}>
+              総処理時間: {Number(result.timing.elapsed_sec).toFixed(1)} 秒
+            </div>
+          )}
           <pre
             style={{
               margin: 0,

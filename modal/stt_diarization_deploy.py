@@ -112,12 +112,12 @@ class DiarizationService:
                 )
 
         return {
-            "segments": speaker_segments,
+            "segments": smooth_speaker_segments(speaker_segments),
             "speech_segments": merge_speech_segments(speech_segments),
         }
 
 
-def merge_speech_segments(segments, max_gap=0.6, min_duration=0.6):
+def merge_speech_segments(segments, max_gap=0.8, min_duration=0.8):
     if not segments:
         return []
 
@@ -136,3 +136,54 @@ def merge_speech_segments(segments, max_gap=0.6, min_duration=0.6):
         for seg in merged
         if (seg["end"] - seg["start"]) >= min_duration
     ]
+
+
+def smooth_speaker_segments(
+    segments,
+    min_duration=0.35,
+    max_gap_same_speaker=0.4,
+):
+    if not segments:
+        return []
+
+    segments = sorted(segments, key=lambda x: x["start"])
+
+    # 1) 同一話者で近い区間を先に結合
+    merged = [segments[0].copy()]
+    for seg in segments[1:]:
+        last = merged[-1]
+        if (
+            seg["speaker"] == last["speaker"]
+            and seg["start"] - last["end"] <= max_gap_same_speaker
+        ):
+            last["end"] = max(last["end"], seg["end"])
+        else:
+            merged.append(seg.copy())
+
+    # 2) 短すぎる断片を前後に吸収
+    smoothed = []
+    for i, seg in enumerate(merged):
+        duration = seg["end"] - seg["start"]
+        if duration >= min_duration:
+            smoothed.append(seg)
+            continue
+
+        prev_seg = smoothed[-1] if smoothed else None
+        next_seg = merged[i + 1] if i + 1 < len(merged) else None
+
+        if prev_seg and next_seg:
+            prev_gap = seg["start"] - prev_seg["end"]
+            next_gap = next_seg["start"] - seg["end"]
+
+            if prev_gap <= next_gap:
+                prev_seg["end"] = max(prev_seg["end"], seg["end"])
+            else:
+                next_seg["start"] = min(next_seg["start"], seg["start"])
+        elif prev_seg:
+            prev_seg["end"] = max(prev_seg["end"], seg["end"])
+        elif next_seg:
+            next_seg["start"] = min(next_seg["start"], seg["start"])
+        else:
+            smoothed.append(seg)
+
+    return smoothed

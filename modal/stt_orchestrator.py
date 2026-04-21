@@ -4,6 +4,7 @@ import re
 import uuid
 import asyncio
 import modal
+import time
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,12 +22,13 @@ web_app.add_middleware(
 orchestrator_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
-    .pip_install("fastapi", "python-multipart", "pydub", "openai")
+    .pip_install("fastapi", "python-multipart", "pydub", "google-genai")
 )
 
 job_dict = modal.Dict.from_name("stt-jobs-dict", create_if_missing=True)
 
-LLM_MODEL = "openai/gpt-oss-120b"
+# Gemini API で使うモデル名
+LLM_MODEL = "gemini-2.5-flash"
 TARGET_LINES = 30
 CONTEXT_LINES = 5
 
@@ -75,7 +77,7 @@ PROMPT_TEMPLATE = """あなたはプロフェッショナルな議事録作成�
 @app.function(
     image=orchestrator_image,
     timeout=3600,
-    secrets=[modal.Secret.from_name("deepinfra-secret")]
+    secrets=[modal.Secret.from_name("gemini-secret")],
 )
 async def process_audio_background(
     job_id: str,
@@ -94,6 +96,23 @@ async def process_audio_background(
         asr = ASRService()
         diar = DiarizationService()
 
+        started_at = time.time()
+
+        prev_job = job_dict.get(job_id, {})
+        job_dict[job_id] = {
+            **prev_job,
+            "status": "processing",
+            "started_at": started_at,
+            "current_elapsed_sec": round(started_at - prev_job.get("created_at", started_at), 2),
+        }
+
+        print("========== PIPELINE DEBUG: START ==========")
+        print(f"job_id={job_id}")
+        print(f"audio_bytes_size={len(audio_bytes)}")
+        print(f"num_speakers={num_speakers}")
+        print(f"started_at={started_at}")
+        print("===========================================")
+
         diar_result = await asyncio.to_thread(
             diar.diarize.remote,
             audio_data=audio_bytes,
@@ -105,6 +124,17 @@ async def process_audio_background(
 
         audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
         audio = audio.set_frame_rate(16000).set_channels(1)
+
+        print("========== PIPELINE DEBUG: DIARIZATION ==========")
+        print(f"speaker_segments={len(speaker_segments)}")
+        print(f"speech_segments={len(speech_segments)}")
+        if speaker_segments:
+            print("first_speaker_segment=", speaker_segments[0])
+            print("last_speaker_segment=", speaker_segments[-1])
+        if speech_segments:
+            print("first_speech_segment=", speech_segments[0])
+            print("last_speech_segment=", speech_segments[-1])
+        print("=================================================")
 
         tasks = []
         for seg in speech_segments:
@@ -133,9 +163,21 @@ async def process_audio_background(
             all_char_timestamps.extend(res.get("char_timestamps", []))
         all_char_timestamps.sort(key=lambda x: x["start"])
 
-        transcript = merge_chars_and_speakers_with_gaps(all_char_timestamps, speaker_segments)
+        transcript = merge_chars_and_speakers_with_gaps(
+            all_char_timestamps,
+            speaker_segments,
+        )
+        transcript = merge_small_transcript_segments(transcript)
 
-        # --- ここから LLM 整形 ---
+        print("========== PIPELINE DEBUG: ASR / MERGE ==========")
+        print(f"asr_results={len(asr_results)}")
+        print(f"all_char_timestamps={len(all_char_timestamps)}")
+        print(f"merged_transcript_items={len(transcript)}")
+        if transcript:
+            print("first_transcript_item=", transcript[0])
+            print("last_transcript_item=", transcript[-1])
+        print("=================================================")
+
         cleaned_transcript = await asyncio.to_thread(
             llm_clean_transcript,
             transcript,
@@ -143,19 +185,51 @@ async def process_audio_background(
 
         cleaned_text = transcript_json_to_plain_text(cleaned_transcript)
 
+        print("========== PIPELINE DEBUG: FINAL ==========")
+        print(f"cleaned_transcript_items={len(cleaned_transcript)}")
+        print(f"cleaned_text_chars={len(cleaned_text)}")
+        print("===========================================")
+
+        finished_at = time.time()
+        prev_job = job_dict.get(job_id, {})
+        created_at = prev_job.get("created_at", started_at)
+
         job_dict[job_id] = {
             "status": "completed",
+            "created_at": created_at,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_sec": round(finished_at - created_at, 2),
+            "current_elapsed_sec": round(finished_at - created_at, 2),
             "result": {
                 "transcript": transcript,
                 "cleaned_transcript": cleaned_transcript,
                 "cleaned_text": cleaned_text,
+                "timing": {
+                    "created_at": created_at,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "elapsed_sec": round(finished_at - created_at, 2),
+                },
             },
         }
 
     except Exception as e:
+        print("========== PIPELINE DEBUG: ERROR ==========")
+        print(repr(e))
+        print("===========================================")
+        finished_at = time.time()
+        prev_job = job_dict.get(job_id, {})
+        created_at = prev_job.get("created_at", finished_at)
+
         job_dict[job_id] = {
             "status": "error",
             "message": str(e),
+            "created_at": created_at,
+            "started_at": prev_job.get("started_at"),
+            "finished_at": finished_at,
+            "elapsed_sec": round(finished_at - created_at, 2),
+            "current_elapsed_sec": round(finished_at - created_at, 2),
         }
 
 
@@ -176,18 +250,44 @@ async def transcribe_endpoint(
     audio_bytes = await audio_file.read()
 
     job_id = str(uuid.uuid4())
-    job_dict[job_id] = {"status": "processing"}
+    created_at = time.time()
+
+    job_dict[job_id] = {
+        "status": "processing",
+        "created_at": created_at,
+        "started_at": None,
+        "finished_at": None,
+        "elapsed_sec": None,
+        "current_elapsed_sec": 0.0,
+    }
+
+    print("========== API DEBUG: NEW JOB ==========")
+    print(f"job_id={job_id}")
+    print(f"audio_bytes_size={len(audio_bytes)}")
+    print(f"num_speakers={num_speakers}")
+    print(f"created_at={created_at}")
+    print("========================================")
 
     process_audio_background.spawn(job_id, audio_bytes, num_speakers)
 
-    return {"job_id": job_id}
+    return {
+        "job_id": job_id,
+        "created_at": created_at,
+    }
 
 
 @web_app.get("/status/{job_id}")
 def get_status(job_id: str):
     if job_id not in job_dict:
         return {"status": "not_found"}
-    return job_dict[job_id]
+
+    job = dict(job_dict[job_id])
+
+    created_at = job.get("created_at")
+    if created_at and job.get("status") == "processing":
+        job["current_elapsed_sec"] = round(time.time() - created_at, 2)
+
+    return job
 
 
 def merge_chars_and_speakers_with_gaps(char_timestamps, speaker_segments):
@@ -216,12 +316,14 @@ def merge_chars_and_speakers_with_gaps(char_timestamps, speaker_segments):
                 merged[-1]["text"] += text_chunk
             merged[-1]["end"] = char_info["end"]
         else:
-            merged.append({
-                "speaker": speaker,
-                "text": text_chunk,
-                "start": char_info["start"],
-                "end": char_info["end"]
-            })
+            merged.append(
+                {
+                    "speaker": speaker,
+                    "text": text_chunk,
+                    "start": char_info["start"],
+                    "end": char_info["end"],
+                }
+            )
 
     return merged
 
@@ -240,20 +342,27 @@ def transcript_to_lines(transcript: list[dict]) -> list[str]:
     return lines
 
 
-def chunk_lines(lines: list[str], target_size: int = 30, context_size: int = 5) -> list[dict]:
+def chunk_lines(
+    lines: list[str],
+    target_size: int = 30,
+    context_size: int = 5,
+) -> list[dict]:
     chunks = []
     start = 0
     while start < len(lines):
         end = min(start + target_size, len(lines))
         context_start = max(0, start - context_size)
 
-        chunks.append({
-            "context_lines": lines[context_start:start],
-            "target_lines": lines[start:end],
-        })
+        chunks.append(
+            {
+                "context_lines": lines[context_start:start],
+                "target_lines": lines[start:end],
+            }
+        )
         start = end
 
     return chunks
+
 
 def transcript_json_to_plain_text(transcript: list[dict]) -> str:
     lines = []
@@ -263,44 +372,174 @@ def transcript_json_to_plain_text(transcript: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def llm_clean_transcript(transcript: list[dict]) -> list[dict]:
-    from openai import OpenAI
+def debug_preview(text: str, limit: int = 500) -> str:
+    text = text.replace("\n", "\\n")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
 
-    client = OpenAI(
-        api_key=os.environ["DEEPINFRA_TOKEN"],
-        base_url="https://api.deepinfra.com/v1/openai"
+
+def log_transcript_stats(
+    transcript: list[dict],
+    lines: list[str],
+    chunks: list[dict],
+) -> None:
+    total_chars = sum(len(item.get("text", "")) for item in transcript)
+    total_duration = 0.0
+    if transcript:
+        total_duration = float(transcript[-1]["end"]) - float(transcript[0]["start"])
+
+    print("========== LLM DEBUG: TRANSCRIPT SUMMARY ==========")
+    print(f"transcript_items={len(transcript)}")
+    print(f"line_count={len(lines)}")
+    print(f"chunk_count={len(chunks)}")
+    print(f"total_text_chars={total_chars}")
+    print(f"approx_total_duration_sec={total_duration:.2f}")
+
+    if transcript:
+        print("first_transcript_item=", transcript[0])
+        print("last_transcript_item=", transcript[-1])
+
+    if lines:
+        print("first_3_lines:")
+        for line in lines[:3]:
+            print("  ", line)
+
+    print("===================================================")
+
+
+def log_chunk_input(idx: int, total: int, chunk: dict, prompt: str) -> None:
+    print(f"========== LLM DEBUG: CHUNK INPUT {idx}/{total} ==========")
+    print(f"context_line_count={len(chunk['context_lines'])}")
+    print(f"target_line_count={len(chunk['target_lines'])}")
+    print(f"prompt_chars={len(prompt)}")
+
+    print("context_preview:")
+    print(debug_preview("\n".join(chunk["context_lines"]), limit=700))
+
+    print("target_preview:")
+    print(debug_preview("\n".join(chunk["target_lines"]), limit=1000))
+
+    print("prompt_preview:")
+    print(debug_preview(prompt, limit=1200))
+    print("==========================================================")
+
+
+def log_chunk_output(idx: int, total: int, cleaned_text: str) -> None:
+    line_count = len([line for line in cleaned_text.splitlines() if line.strip()])
+
+    print(f"========== LLM DEBUG: CHUNK OUTPUT {idx}/{total} ==========")
+    print(f"response_chars={len(cleaned_text)}")
+    print(f"response_line_count={line_count}")
+    print("response_preview:")
+    print(debug_preview(cleaned_text, limit=1200))
+    print("===========================================================")
+
+
+def log_parse_result(
+    cleaned_full_text: str,
+    parsed: list[dict],
+    original_transcript: list[dict],
+) -> None:
+    print("========== LLM DEBUG: PARSE RESULT ==========")
+    print(f"cleaned_full_text_chars={len(cleaned_full_text)}")
+    print(f"cleaned_full_text_lines={len([x for x in cleaned_full_text.splitlines() if x.strip()])}")
+    print(f"parsed_items={len(parsed)}")
+    print(f"original_transcript_items={len(original_transcript)}")
+
+    if parsed:
+        print("first_parsed_item=", parsed[0])
+        print("last_parsed_item=", parsed[-1])
+
+    print("=============================================")
+
+
+def call_llm_for_chunk(index: int, total: int, chunk: dict) -> dict:
+    from google import genai
+    from google.genai import types
+
+    prompt = PROMPT_TEMPLATE.format(
+        context_lines="\n".join(chunk["context_lines"]) if chunk["context_lines"] else "(なし)",
+        target_lines="\n".join(chunk["target_lines"]),
     )
 
-    original_lines = transcript_to_lines(transcript)
-    chunks = chunk_lines(original_lines, target_size=TARGET_LINES, context_size=CONTEXT_LINES)
+    log_chunk_input(index, total, chunk, prompt)
 
-    cleaned_text_blocks = []
-    for chunk in chunks:
-        prompt = PROMPT_TEMPLATE.format(
-            context_lines="\n".join(chunk["context_lines"]) if chunk["context_lines"] else "(なし)",
-            target_lines="\n".join(chunk["target_lines"]),
-        )
+    started = time.time()
+    print(f"[LLM START] chunk={index}/{total}")
 
-        resp = client.chat.completions.create(
+    try:
+        client = genai.Client()
+
+        response = client.models.generate_content(
             model=LLM_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a careful transcript editor. Do not add markdown. Do not omit content. Output only the target portion in the specified plain-text format.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
-            ],
-            temperature=0.1,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                system_instruction=(
+                    "You are a careful transcript editor. "
+                    "Do not add markdown. Do not omit content. "
+                    "Output only the target portion in the specified plain-text format."
+                ),
+            ),
         )
 
-        cleaned_text = resp.choices[0].message.content or ""
-        cleaned_text_blocks.append(cleaned_text.strip())
+        cleaned_text = response.text or ""
 
-    cleaned_full_text = "\n".join(block for block in cleaned_text_blocks if block.strip())
-    return parse_cleaned_transcript(cleaned_full_text, transcript)
+        elapsed = round(time.time() - started, 2)
+        print(
+            f"[LLM DONE] chunk={index}/{total} "
+            f"response_chars={len(cleaned_text)} elapsed_sec={elapsed}"
+        )
+
+        log_chunk_output(index, total, cleaned_text)
+
+        return {
+            "index": index,
+            "cleaned_text": cleaned_text,
+        }
+
+    except Exception as e:
+        elapsed = round(time.time() - started, 2)
+        print(
+            f"[LLM ERROR] chunk={index}/{total} "
+            f"elapsed_sec={elapsed} error={repr(e)}"
+        )
+        raise
+
+
+def llm_clean_transcript(transcript: list[dict]) -> list[dict]:
+    original_lines = transcript_to_lines(transcript)
+    chunks = chunk_lines(
+        original_lines,
+        target_size=TARGET_LINES,
+        context_size=CONTEXT_LINES,
+    )
+
+    log_transcript_stats(transcript, original_lines, chunks)
+
+    async def _runner():
+        tasks = [
+            asyncio.to_thread(call_llm_for_chunk, i, len(chunks), chunk)
+            for i, chunk in enumerate(chunks, start=1)
+        ]
+        return await asyncio.gather(*tasks)
+
+    chunk_results = asyncio.run(_runner())
+    chunk_results = sorted(chunk_results, key=lambda x: x["index"])
+
+    cleaned_text_blocks = [
+        item["cleaned_text"].strip()
+        for item in chunk_results
+        if item["cleaned_text"].strip()
+    ]
+
+    cleaned_full_text = "\n".join(cleaned_text_blocks)
+
+    parsed = parse_cleaned_transcript(cleaned_full_text, transcript)
+    log_parse_result(cleaned_full_text, parsed, transcript)
+
+    return parsed
 
 
 LINE_RE = re.compile(
@@ -308,13 +547,13 @@ LINE_RE = re.compile(
 )
 
 
-def parse_cleaned_transcript(cleaned_text: str, original_transcript: list[dict]) -> list[dict]:
-    """
-    LLM のプレーンテキスト出力を transcript JSON に戻す。
-    start は LLM 出力の timestamp を使い、
-    end は次の発話開始時刻の直前、最後だけ元 transcript の末尾 end を使う。
-    """
+def parse_cleaned_transcript(
+    cleaned_text: str,
+    original_transcript: list[dict],
+) -> list[dict]:
     parsed = []
+    unparsable_lines = []
+
     for raw_line in cleaned_text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -322,26 +561,102 @@ def parse_cleaned_transcript(cleaned_text: str, original_transcript: list[dict])
 
         m = LINE_RE.match(line)
         if not m:
+            unparsable_lines.append(line)
             continue
 
         mm = int(m.group("mm"))
         ss = float(m.group("ss"))
         start = mm * 60 + ss
 
-        parsed.append({
-            "speaker": m.group("speaker").strip(),
-            "text": m.group("text").strip(),
-            "start": start,
-            "end": start,  # 仮
-        })
+        parsed.append(
+            {
+                "speaker": m.group("speaker").strip(),
+                "text": m.group("text").strip(),
+                "start": start,
+                "end": start,
+            }
+        )
+
+    print("========== LLM DEBUG: PARSER ==========")
+    print(f"parsed_lines={len(parsed)}")
+    print(f"unparsable_lines={len(unparsable_lines)}")
+    if unparsable_lines:
+        print("unparsable_preview:")
+        for line in unparsable_lines[:10]:
+            print("  ", line)
+    print("=======================================")
 
     if not parsed:
+        print("PARSER FALLBACK: returning original_transcript")
         return original_transcript
 
-    # end を補完
     for i in range(len(parsed) - 1):
         parsed[i]["end"] = parsed[i + 1]["start"]
 
-    parsed[-1]["end"] = float(original_transcript[-1]["end"]) if original_transcript else parsed[-1]["start"]
-
+    parsed[-1]["end"] = (
+        float(original_transcript[-1]["end"])
+        if original_transcript
+        else parsed[-1]["start"]
+    )
     return parsed
+
+def merge_small_transcript_segments(
+    transcript: list[dict],
+    min_chars: int = 6,
+    min_duration: float = 1.2,
+    max_gap_same_speaker: float = 1.0,
+) -> list[dict]:
+    if not transcript:
+        return []
+
+    merged = [transcript[0].copy()]
+
+    for seg in transcript[1:]:
+        last = merged[-1]
+        gap = seg["start"] - last["end"]
+        seg_duration = seg["end"] - seg["start"]
+
+        is_small = (
+            len(seg.get("text", "").strip()) <= min_chars
+            or seg_duration <= min_duration
+        )
+
+        if (
+            seg["speaker"] == last["speaker"]
+            and (gap <= max_gap_same_speaker or is_small)
+        ):
+            if last["text"] and seg["text"]:
+                last["text"] += " " + seg["text"]
+            else:
+                last["text"] += seg["text"]
+            last["end"] = seg["end"]
+        else:
+            merged.append(seg.copy())
+
+    # 2パス目: 単独の極小断片を前後に吸収
+    final = []
+    for i, seg in enumerate(merged):
+        text_len = len(seg.get("text", "").strip())
+        duration = seg["end"] - seg["start"]
+        is_tiny = text_len <= 2 or duration <= 0.6
+
+        if not is_tiny:
+            final.append(seg)
+            continue
+
+        prev_seg = final[-1] if final else None
+        next_seg = merged[i + 1] if i + 1 < len(merged) else None
+
+        if prev_seg and prev_seg["speaker"] == seg["speaker"]:
+            prev_seg["text"] += seg["text"]
+            prev_seg["end"] = seg["end"]
+        elif next_seg and next_seg["speaker"] == seg["speaker"]:
+            next_seg["text"] = seg["text"] + next_seg["text"]
+            next_seg["start"] = seg["start"]
+        elif prev_seg:
+            prev_seg["text"] += seg["text"]
+            prev_seg["end"] = seg["end"]
+        else:
+            final.append(seg)
+
+    return final
