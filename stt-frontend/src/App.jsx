@@ -70,7 +70,7 @@ function App() {
 
     try {
       const baseUrl =
-        'https://shogo-toiyama--transcription-orchestrator-v1-fastapi-app.modal.run'
+        'https://shogo-toiyama--transcription-orchestrator-kotoba-v1-fastapi-app.modal.run'
 
       const response = await fetch(`${baseUrl}/transcribe`, {
         method: 'POST',
@@ -230,6 +230,7 @@ function App() {
               textAlign: 'left',
               padding: '10px 12px',
               border: 'none',
+              color: 'black',
               borderBottom: index !== items.length - 1 ? '1px solid #f0f0f0' : 'none',
               background: selectedIndex === index ? '#EAF3FF' : '#fff',
               cursor: 'pointer',
@@ -299,8 +300,8 @@ function App() {
                   selectedIndex={selectedAsrChunk}
                   onSelect={setSelectedAsrChunk}
                   renderLabel={(item, index) =>
-                    `#${index} [${item?.start ?? '-'} - ${item?.end ?? '-'}] ${
-                      (item?.text ?? '').slice(0, 40) || '(empty)'
+                    `#${index} [${item?.start ?? '-'} - ${item?.end ?? '-'}] ${item?.speaker_id ?? 'UNKNOWN'} ${
+                      (item?.text ?? '').slice(0, 30) || '(empty)'
                     }`
                   }
                 />
@@ -316,7 +317,17 @@ function App() {
                 </Panel>
   
                 <Panel title="Selected ASR Char Timestamps">
-                  <CodeBlock value={safeJson(chunk?.char_timestamps ?? [])} maxHeight={520} />
+                  {Array.isArray(chunk?.char_timestamps) && chunk.char_timestamps.length > 0 ? (
+                    <CodeBlock value={safeJson(chunk.char_timestamps)} maxHeight={520} />
+                  ) : (
+                    <CodeBlock
+                      value={'Kotoba版では char_timestamps は現在出していません。raw_chunk を確認してください。'}
+                      maxHeight={160}
+                    />
+                  )}
+                </Panel>
+                <Panel title="Selected ASR Raw Chunk">
+                  <CodeBlock value={safeJson(chunk?.raw_chunk ?? null)} maxHeight={420} />
                 </Panel>
               </div>
             </div>
