@@ -32,7 +32,29 @@ LLM_MODEL = "gemini-2.5-flash"
 TARGET_LINES = 30
 CONTEXT_LINES = 5
 
+COMPARE_MERGE_MODEL = "gemini-2.5-flash"
+RESCUE_MIN_LEN_SEC = 1.5
+RESCUE_PARALLEL_LIMIT = 8
+
 CUT_KEYWORDS = ["なので", "だから", "ですが", "だけど", "そして", "それで", "さらに", "しかし", "でも", "けど", "ただ", "ちなみに", "ところで", "というのも", "ですね", "でしょう", "ますね", "ですよ", "ましょう"]
+PRIMARY_MIN_SILENCE_MS = 500
+PRIMARY_MIN_CHUNK_MS = 40 * 1000
+PRIMARY_FORCE_MAX_CHUNK_MS = 80 * 1000
+
+TURN_STATS_WINDOW_SEC = 10.0
+SHORT_TURN_SEC = 3.0
+
+COVERAGE_MAX_GAP_SEC = 0.25
+COVERAGE_MIN_RATIO = 0.45
+COVERAGE_MIN_SPEECH_SEC = 1.0
+
+FRAGMENT_MAX_CHARS = 4
+FRAGMENT_MAX_DURATION_SEC = 1.2
+
+RESCUE_REGION_MERGE_GAP_SEC = 1.0
+RESCUE_REGION_MARGIN_SEC = 2.5
+RESCUE_REGION_MAX_LEN_SEC = 15.0
+RESCUE_SPEAKER_MARGIN_SEC = 0.5
 
 PROMPT_TEMPLATE = """あなたはプロフェッショナルな議事録作成者であり、優秀な編集者です。
 音声認識（ASR）から出力された1行ずつの会話テキストを、読みやすく自然な会話劇に整形してください。
@@ -75,6 +97,60 @@ PROMPT_TEMPLATE = """あなたはプロフェッショナルな議事録作成�
 {target_lines}
 """
 
+COMPARE_AND_MERGE_PROMPT_TEMPLATE = """あなたは会話文字起こしの統合編集者です。
+以下の4つの情報を比較し、指定された rescue 区間だけについて、最も自然で忠実な会話テキストを復元してください。
+
+【使う情報】
+1. Speaker diarization
+   - どの時間帯に誰が話しているかの基準です。
+   - speaker の切り替わり順序は、基本的に diarization を優先してください。
+
+2. Primary Parakeet transcript
+   - 単語レベル・日本語表現の自然さの主証拠です。
+   - 可能な限り Parakeet の語彙・表現を優先してください。
+
+3. Rescue Parakeet transcript
+   - 問題区間だけ短く切り出して再実行した結果です。
+   - Primary より自然で、欠落補完に役立つ場合は使ってください。
+
+4. Rescue Kotoba transcript
+   - 会話の骨格、短いターン、話者交代の検出に役立つ補助証拠です。
+   - ただし単語の誤りや崩れがあり得るため、単語そのものは Parakeet を優先してください。
+
+5. 出力形式の厳守:
+   - 絶対にプレーンテキストのみの指定されたフォーマットで出力してください。マークダウンのコードフェンスや「こちらが...」のような話し言葉は含めないでください。
+
+【最重要ルール】
+- 事実の創作は禁止です。
+- 聞こえていない内容を想像で補完しすぎないでください。
+- 単語・日本語表現は Parakeet を優先してください。
+- 話者交代や短いターンの存在は Kotoba と diarization を参照してください。
+- 同じ内容の重複は削除してください。
+- rescue 区間だけを出力してください。
+- speaker ラベルは diarization に従ってください。
+- 出力形式に従ってください。それ以外のフォーマットや話し言葉は絶対に入れないでください。
+
+【出力形式】
+[00:12.3s] SPEAKER_01: 整形されたテキスト。
+[00:15.8s] SPEAKER_02: 整形されたテキスト。
+
+【対象 rescue 区間】
+start={region_start}
+end={region_end}
+
+【Diarization speaker segments】
+{speaker_segments_text}
+
+【Primary Parakeet transcript in region】
+{primary_text}
+
+【Rescue Parakeet transcript in region】
+{rescue_parakeet_text}
+
+【Rescue Kotoba transcript in region】
+{rescue_kotoba_text}
+"""
+
 @app.function(
     image=orchestrator_image,
     timeout=3600,
@@ -113,68 +189,57 @@ async def process_audio_background(
         }
 
         print("========== 🚀 PIPELINE START (Parallel Mode) ==========")
-        
+
         # 0. 音声データのロードと前処理
         audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
         audio = audio.set_frame_rate(16000).set_channels(1)
 
         # ---------------------------------------------------------
-        # 1. タスクの準備 (Diarization & ASRを並列に構成)
+        # 1. タスクの準備
         # ---------------------------------------------------------
-        
-        # A. Diarizationタスクの定義
+
+        # A. Diarization
         diar_task = asyncio.to_thread(
             diar.diarize.remote,
             audio_data=audio_bytes,
             num_speakers=num_speakers,
         )
 
-        # B. ASRタスクの準備（無音検知によるスマート分割）
-        print("🔍 Detecting silence for safe ASR chunking...")
-        silences = detect_silence(audio, min_silence_len=500, silence_thresh=audio.dBFS - 16)
+        # B. Primary ASR cut points
+        print("🔍 Detecting silence for primary Parakeet chunking...")
+        cut_points, silence_ranges = build_primary_asr_cut_points(
+            audio,
+            min_silence_len_ms=PRIMARY_MIN_SILENCE_MS,
+            min_chunk_ms=PRIMARY_MIN_CHUNK_MS,
+            force_max_chunk_ms=PRIMARY_FORCE_MAX_CHUNK_MS,
+        )
 
-        TARGET_CHUNK_MS = 30 * 1000  # 最低30秒ごとに区切る
-        cut_points = [0]
-        current_start = 0
-        for sil_start, sil_end in silences:
-            mid_silence = (sil_start + sil_end) / 2
-            if mid_silence - current_start >= TARGET_CHUNK_MS:
-                cut_points.append(int(mid_silence))
-                current_start = mid_silence
-        cut_points.append(len(audio))
-
-        asr_tasks = []
-        for i in range(len(cut_points) - 1):
-            start_ms = cut_points[i]
-            end_ms = cut_points[i+1]
-            if end_ms <= start_ms: continue
-
-            chunk = audio[start_ms:end_ms]
-            buf = io.BytesIO()
-            chunk.export(buf, format="wav")
-
-            asr_tasks.append(
-                asyncio.to_thread(
-                    asr.transcribe_segment.remote,
-                    segment_data=buf.getvalue(),
-                    segment_start_sec=start_ms / 1000.0,
-                    segment_end_sec=end_ms / 1000.0,
-                )
-            )
+        asr_tasks = build_asr_tasks_from_cut_points(
+            audio=audio,
+            cut_points=cut_points,
+            asr=asr,
+        )
 
         # ---------------------------------------------------------
-        # 2. 🌟 真の並列実行 (一斉にスタートして待ち合わせ)
+        # 2. 並列実行
         # ---------------------------------------------------------
         print(f"🔥 Launching Diarization and {len(asr_tasks)} ASR tasks in parallel...")
-        
-        # すべてのタスクを同時に実行し、結果が全て揃うのを待つ
-        # all_results[0] が Diarization、それ以降が ASR の結果になる
         all_results = await asyncio.gather(diar_task, *asr_tasks)
 
         diar_result = all_results[0]
         asr_results = all_results[1:]
 
-        speaker_segments = diar_result.get("segments", [])
+        raw_speaker_segments = diar_result.get("segments", [])
+        raw_speech_segments = diar_result.get("speech_segments", [])
+
+        speaker_segments = normalize_speaker_segments(raw_speaker_segments)
+        speech_segments = normalize_speech_segments(raw_speech_segments)
+
+        turn_stats = build_turn_statistics(
+            speaker_segments=speaker_segments,
+            window_sec=TURN_STATS_WINDOW_SEC,
+            short_turn_sec=SHORT_TURN_SEC,
+        )
 
         update_job_debug(
             job_id,
@@ -182,20 +247,27 @@ async def process_audio_background(
             {
                 "summary": {
                     "speaker_segment_count": len(speaker_segments),
+                    "speech_segment_count": len(speech_segments),
                     "num_speakers": num_speakers,
                 },
                 "speaker_segments": speaker_segments,
+                "speech_segments": speech_segments,
+                "turn_stats": turn_stats,
             },
         )
 
         # ---------------------------------------------------------
-        # 3. 事後処理 (Late Fusion: マージとスマート・チャンキング)
+        # 3. Primary ASR post-process
         # ---------------------------------------------------------
-        # 全ての文字データを統合して時間順にソート
         all_char_timestamps = []
         for res in asr_results:
             all_char_timestamps.extend(res.get("char_timestamps", []))
         all_char_timestamps.sort(key=lambda x: x["start"])
+
+        coverage_intervals = build_char_coverage_intervals(
+            all_char_timestamps,
+            max_gap_sec=COVERAGE_MAX_GAP_SEC,
+        )
 
         asr_debug_chunks = build_asr_debug_chunks(asr_results)
         update_job_debug(
@@ -205,16 +277,23 @@ async def process_audio_background(
                 "summary": {
                     "chunk_count": len(asr_results),
                     "char_timestamp_count": len(all_char_timestamps),
+                    "cut_point_count": len(cut_points),
+                    "silence_count": len(silence_ranges),
                 },
                 "chunks": asr_debug_chunks,
+                "coverage_intervals": coverage_intervals,
             },
         )
 
-        # 文字と話者ラベルをマージ（句点・無音・文字数による自動分割）
+        # ---------------------------------------------------------
+        # 4. Primary fusion
+        # ---------------------------------------------------------
         transcript = merge_chars_and_speakers_with_late_fusion(
             all_char_timestamps,
             speaker_segments,
         )
+
+        transcript = merge_small_transcript_segments(transcript)
 
         fusion_plain_text = build_fusion_plain_text(transcript)
 
@@ -232,6 +311,129 @@ async def process_audio_background(
         )
 
         print(f"✅ Merged into {len(transcript)} transcript segments.")
+
+        # ---------------------------------------------------------
+        # 5. Rescue regions の特定 (欠落 ＆ 短いターン)
+        # ---------------------------------------------------------
+        print("🔍 Detecting Rescue Regions...")
+        
+        # A. 文字起こしが抜けている区間
+        coverage_gap_regions = detect_coverage_gap_regions(
+            speaker_segments=speaker_segments,
+            speech_segments=speech_segments,
+            coverage_intervals=coverage_intervals,
+            min_ratio=COVERAGE_MIN_RATIO,
+            min_speech_sec=COVERAGE_MIN_SPEECH_SEC,
+        )
+        
+        # B. 短い会話がポンポン入れ替わる区間
+        short_turn_regions = detect_short_turn_regions(
+            speaker_segments=speaker_segments,
+            window_sec=TURN_STATS_WINDOW_SEC,
+        )
+        
+        # 2つを結合してマージする
+        combined_candidate_regions = coverage_gap_regions + short_turn_regions
+        raw_rescue_regions = merge_time_regions(combined_candidate_regions, merge_gap_sec=RESCUE_REGION_MERGE_GAP_SEC)
+        
+        # 前後に少し余裕(マージン)を持たせる
+        rescue_regions = [
+            expand_region_with_limits(r, len(audio) / 1000.0, margin_sec=RESCUE_REGION_MARGIN_SEC)
+            for r in raw_rescue_regions
+        ]
+
+        update_job_debug(
+            job_id,
+            "rescue_detection",
+            {
+                "summary": {
+                    "speaker_segment_region_count": len(rescue_regions),
+                },
+                "short_turn_regions": [],
+                "coverage_gap_regions": [],
+                "fragment_regions": [],
+                "merged_regions": rescue_regions,
+            },
+        )
+
+        # ---------------------------------------------------------
+        # 6. Rescue ASR (Parakeet re-run + Kotoba)
+        # ---------------------------------------------------------
+        KotobaWhisperService = modal.Cls.from_name(
+            "transcription-kotoba-v1",
+            "KotobaWhisperService",
+        )
+        kotoba = KotobaWhisperService()
+
+        rescue_regions = [
+            r for r in rescue_regions
+            if r["duration"] >= RESCUE_MIN_LEN_SEC
+        ]
+
+        rescue_region_results = await run_rescue_asr_for_regions(
+            audio=audio,
+            rescue_regions=rescue_regions,
+            speaker_segments=speaker_segments,
+            asr=asr,
+            kotoba=kotoba,
+            parallel_limit=RESCUE_PARALLEL_LIMIT,
+        )
+
+        update_job_debug(
+            job_id,
+            "rescue_asr",
+            {
+                "summary": {
+                    "region_count": len(rescue_region_results),
+                },
+                "regions": rescue_region_results,
+            },
+        )
+
+        # ---------------------------------------------------------
+        # 7. Compare & Merge for rescue regions (parallel)
+        # ---------------------------------------------------------
+        compare_merge_results = await run_compare_and_merge_for_regions(
+            job_id=job_id,
+            rescue_region_results=rescue_region_results,
+            base_transcript=transcript,
+            speaker_segments=speaker_segments,
+            parallel_limit=4,
+        )
+
+        rewritten_regions = [
+            {
+                "start": item["region"]["start"],
+                "end": item["region"]["end"],
+                "transcript": item["merged_transcript"],
+            }
+            for item in compare_merge_results
+        ]
+
+        # ---------------------------------------------------------
+        # 8. Replace rescue regions into base transcript
+        # ---------------------------------------------------------
+        if rewritten_regions:
+            transcript = replace_regions_in_transcript(
+                base_transcript=transcript,
+                rewritten_regions=rewritten_regions,
+            )
+
+            fusion_plain_text = build_fusion_plain_text(transcript)
+
+            update_job_debug(
+                job_id,
+                "fusion",
+                {
+                    "summary": {
+                        "transcript_items": len(transcript),
+                        "plain_text_chars": len(fusion_plain_text),
+                        "rescue_rewritten_region_count": len(rewritten_regions),
+                    },
+                    "transcript": transcript,
+                    "plain_text": fusion_plain_text,
+                },
+            )
 
         # ---------------------------------------------------------
         # 4. LLM整形
@@ -331,15 +533,33 @@ async def transcribe_endpoint(
             "asr": {
                 "summary": {},
                 "chunks": [],
+                "coverage_intervals": [],
             },
             "diarization": {
                 "summary": {},
                 "speaker_segments": [],
+                "speech_segments": [],
+                "turn_stats": {},
             },
             "fusion": {
                 "summary": {},
                 "transcript": [],
                 "plain_text": "",
+            },
+            "rescue_detection": {
+                "summary": {},
+                "short_turn_regions": [],
+                "coverage_gap_regions": [],
+                "fragment_regions": [],
+                "merged_regions": [],
+            },
+            "rescue_asr": {
+                "summary": {},
+                "regions": [],
+            },
+            "compare_merge": {
+                "summary": {},
+                "regions": [],
             },
             "llm": {
                 "summary": {},
@@ -881,18 +1101,735 @@ def append_job_debug_list(job_id: str, section: str, list_name: str, item: dict)
 def build_asr_debug_chunks(asr_results: list[dict]) -> list[dict]:
     chunks = []
     for i, res in enumerate(asr_results):
+        char_timestamps = res.get("char_timestamps", [])
+        word_timestamps = res.get("word_timestamps", [])
         chunks.append({
             "index": i,
             "start": res.get("start"),
             "end": res.get("end"),
             "text": res.get("text") or res.get("raw_text", ""),
-            "char_timestamps": res.get("char_timestamps", []),
+            "confidence": res.get("confidence"),
+            "char_count": len(char_timestamps),
+            "word_count": len(word_timestamps),
+            "char_timestamps": char_timestamps,
+            "word_timestamps": word_timestamps,
         })
     return chunks
-
 
 def build_fusion_plain_text(transcript: list[dict]) -> str:
     return "\n".join(
         f"[{format_seconds(float(item['start']))}] {item['speaker']}: {item['text']}"
         for item in transcript
     )
+
+
+def build_primary_asr_cut_points(
+    audio,
+    min_silence_len_ms: int = 500,
+    min_chunk_ms: int = 10_000,
+    force_max_chunk_ms: int = 20_000,
+):
+    from pydub.silence import detect_silence
+
+    silences = detect_silence(
+        audio,
+        min_silence_len=min_silence_len_ms,
+        silence_thresh=audio.dBFS - 16,
+    )
+
+    cut_points = [0]
+    current_start = 0
+    audio_len = len(audio)
+
+    while current_start < audio_len:
+        hard_end = min(current_start + force_max_chunk_ms, audio_len)
+
+        candidate_midpoints = []
+        for sil_start, sil_end in silences:
+            mid = int((sil_start + sil_end) / 2)
+            if current_start + min_chunk_ms <= mid <= hard_end:
+                candidate_midpoints.append(mid)
+
+        if candidate_midpoints:
+            next_cut = candidate_midpoints[-1]
+        else:
+            next_cut = hard_end
+
+        if next_cut <= current_start:
+            break
+
+        cut_points.append(next_cut)
+        current_start = next_cut
+
+        if current_start >= audio_len:
+            break
+
+    if cut_points[-1] != audio_len:
+        cut_points.append(audio_len)
+
+    cut_points = sorted(set(int(x) for x in cut_points))
+
+    return cut_points, silences
+
+
+def build_asr_tasks_from_cut_points(audio, cut_points, asr):
+    tasks = []
+
+    for i in range(len(cut_points) - 1):
+        start_ms = cut_points[i]
+        end_ms = cut_points[i + 1]
+        if end_ms <= start_ms:
+            continue
+
+        chunk = audio[start_ms:end_ms]
+        buf = io.BytesIO()
+        chunk.export(buf, format="wav")
+
+        tasks.append(
+            asyncio.to_thread(
+                asr.transcribe_segment.remote,
+                segment_data=buf.getvalue(),
+                segment_start_sec=start_ms / 1000.0,
+                segment_end_sec=end_ms / 1000.0,
+            )
+        )
+
+    return tasks
+
+def normalize_speaker_segments(segments: list[dict]) -> list[dict]:
+    normalized = []
+    for seg in segments or []:
+        start = float(seg["start"])
+        end = float(seg["end"])
+        if end <= start:
+            continue
+
+        normalized.append(
+            {
+                "start": start,
+                "end": end,
+                "speaker": seg["speaker"],
+            }
+        )
+
+    normalized.sort(key=lambda x: (x["start"], x["end"]))
+    return normalized
+
+
+def normalize_speech_segments(segments: list[dict]) -> list[dict]:
+    normalized = []
+    for seg in segments or []:
+        start = float(seg["start"])
+        end = float(seg["end"])
+        if end <= start:
+            continue
+
+        normalized.append(
+            {
+                "start": start,
+                "end": end,
+            }
+        )
+
+    normalized.sort(key=lambda x: (x["start"], x["end"]))
+    return normalized
+
+
+def build_turn_statistics(
+    speaker_segments: list[dict],
+    window_sec: float = 10.0,
+    short_turn_sec: float = 3.0,
+) -> dict:
+    if not speaker_segments:
+        return {
+            "total_segments": 0,
+            "short_turn_count": 0,
+            "speaker_change_count": 0,
+            "max_changes_in_window": 0,
+        }
+
+    short_turn_count = sum(
+        1
+        for seg in speaker_segments
+        if (seg["end"] - seg["start"]) <= short_turn_sec
+    )
+
+    speaker_change_count = max(0, len(speaker_segments) - 1)
+
+    max_changes_in_window = 0
+    for i, seg in enumerate(speaker_segments):
+        start = seg["start"]
+        end = start + window_sec
+
+        changes = 0
+        prev_speaker = None
+        for other in speaker_segments[i:]:
+            if other["start"] > end:
+                break
+            if prev_speaker is not None and other["speaker"] != prev_speaker:
+                changes += 1
+            prev_speaker = other["speaker"]
+
+        max_changes_in_window = max(max_changes_in_window, changes)
+
+    return {
+        "total_segments": len(speaker_segments),
+        "short_turn_count": short_turn_count,
+        "speaker_change_count": speaker_change_count,
+        "max_changes_in_window": max_changes_in_window,
+    }
+
+def build_char_coverage_intervals(
+    all_char_timestamps: list[dict],
+    max_gap_sec: float = 0.25,
+) -> list[dict]:
+    if not all_char_timestamps:
+        return []
+
+    chars = sorted(all_char_timestamps, key=lambda x: x["start"])
+
+    intervals = []
+    cur_start = float(chars[0]["start"])
+    cur_end = float(chars[0]["end"])
+
+    for item in chars[1:]:
+        start = float(item["start"])
+        end = float(item["end"])
+
+        if start - cur_end <= max_gap_sec:
+            cur_end = max(cur_end, end)
+        else:
+            intervals.append({"start": cur_start, "end": cur_end})
+            cur_start = start
+            cur_end = end
+
+    intervals.append({"start": cur_start, "end": cur_end})
+    return intervals
+
+
+def calc_interval_overlap(start_a, end_a, start_b, end_b) -> float:
+    return max(0.0, min(end_a, end_b) - max(start_a, start_b))
+
+
+def calc_coverage_ratio(region_start, region_end, coverage_intervals: list[dict]) -> float:
+    region_len = max(0.0, region_end - region_start)
+    if region_len <= 0:
+        return 0.0
+
+    covered = 0.0
+    for interval in coverage_intervals:
+        covered += calc_interval_overlap(
+            region_start,
+            region_end,
+            interval["start"],
+            interval["end"],
+        )
+
+    return covered / region_len
+
+def detect_coverage_gap_regions(
+    speaker_segments: list[dict],
+    speech_segments: list[dict],
+    coverage_intervals: list[dict],
+    min_ratio: float = 0.45,
+    min_speech_sec: float = 1.0,
+) -> list[dict]:
+    candidate_regions = []
+
+    # speech_segments を優先し、なければ speaker_segments も参照
+    base_regions = speech_segments if speech_segments else [
+        {"start": s["start"], "end": s["end"]}
+        for s in speaker_segments
+    ]
+
+    for seg in base_regions:
+        start = float(seg["start"])
+        end = float(seg["end"])
+        duration = end - start
+
+        if duration < min_speech_sec:
+            continue
+
+        ratio = calc_coverage_ratio(start, end, coverage_intervals)
+        if ratio < min_ratio:
+            candidate_regions.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "reason": "coverage_gap",
+                    "coverage_ratio": round(ratio, 4),
+                }
+            )
+
+    return merge_time_regions(candidate_regions, merge_gap_sec=1.0)
+
+
+def detect_short_turn_regions(
+    speaker_segments: list[dict],
+    window_sec: float = 10.0,
+    min_changes: int = 3,
+    merge_gap_sec: float = 1.0,
+) -> list[dict]:
+    if not speaker_segments:
+        return []
+
+    regions = []
+
+    for i in range(len(speaker_segments)):
+        window_start = float(speaker_segments[i]["start"])
+        window_end = window_start + window_sec
+
+        included = []
+        for seg in speaker_segments[i:]:
+            if float(seg["start"]) > window_end:
+                break
+            included.append(seg)
+
+        if len(included) < 2:
+            continue
+
+        changes = 0
+        prev_speaker = included[0]["speaker"]
+        for seg in included[1:]:
+            if seg["speaker"] != prev_speaker:
+                changes += 1
+            prev_speaker = seg["speaker"]
+
+        if changes >= min_changes:
+            regions.append(
+                {
+                    "start": window_start,
+                    "end": min(window_end, float(included[-1]["end"])),
+                    "reason": "short_turn",
+                    "speaker_change_count": changes,
+                }
+            )
+
+    return merge_time_regions(regions, merge_gap_sec=merge_gap_sec)
+
+def detect_fragment_regions(
+    transcript: list[dict],
+    max_chars: int = 4,
+    max_duration_sec: float = 1.2,
+) -> list[dict]:
+    regions = []
+
+    for item in transcript:
+        text = (item.get("text") or "").strip()
+        duration = float(item["end"]) - float(item["start"])
+
+        is_tiny = len(text) <= max_chars or duration <= max_duration_sec
+        looks_fragmented = text in {"オ", "オ。", "はい", "えっと", "じゃあ"} or text.endswith("。") and len(text) <= max_chars
+
+        if is_tiny or looks_fragmented:
+            regions.append(
+                {
+                    "start": float(item["start"]),
+                    "end": float(item["end"]),
+                    "reason": "fragment",
+                    "text": text,
+                }
+            )
+
+    return merge_time_regions(regions, merge_gap_sec=0.8)
+
+
+def merge_time_regions(regions: list[dict], merge_gap_sec: float = 1.0) -> list[dict]:
+    if not regions:
+        return []
+
+    sorted_regions = sorted(regions, key=lambda x: (x["start"], x["end"]))
+    merged = [sorted_regions[0].copy()]
+
+    for region in sorted_regions[1:]:
+        last = merged[-1]
+
+        if region["start"] <= last["end"] + merge_gap_sec:
+            last["end"] = max(last["end"], region["end"])
+
+            reasons = set(last.get("reasons", []))
+            if "reason" in last:
+                reasons.add(last["reason"])
+                last.pop("reason", None)
+
+            if "reason" in region:
+                reasons.add(region["reason"])
+
+            for r in region.get("reasons", []):
+                reasons.add(r)
+
+            last["reasons"] = sorted(reasons)
+        else:
+            copied = region.copy()
+            if "reason" in copied:
+                copied["reasons"] = [copied.pop("reason")]
+            merged.append(copied)
+
+    for region in merged:
+        region["start"] = float(region["start"])
+        region["end"] = float(region["end"])
+
+    return merged
+
+
+def expand_region_with_limits(
+    region: dict,
+    audio_duration_sec: float,
+    margin_sec: float = 2.5,
+    max_len_sec: float = 15.0,
+) -> dict:
+    start = max(0.0, float(region["start"]) - margin_sec)
+    end = min(audio_duration_sec, float(region["end"]) + margin_sec)
+
+    if end - start > max_len_sec:
+        center = (start + end) / 2
+        half = max_len_sec / 2
+        start = max(0.0, center - half)
+        end = min(audio_duration_sec, center + half)
+
+    new_region = dict(region)
+    new_region["start"] = round(start, 3)
+    new_region["end"] = round(end, 3)
+    new_region["duration"] = round(end - start, 3)
+    return new_region
+
+def build_rescue_regions_from_speaker_segments(
+    speaker_segments: list[dict],
+    audio_duration_sec: float,
+    margin_sec: float = 0.5,
+) -> list[dict]:
+    regions = []
+
+    for i, seg in enumerate(speaker_segments):
+        raw_start = float(seg["start"])
+        raw_end = float(seg["end"])
+
+        if raw_end <= raw_start:
+            continue
+
+        start = max(0.0, raw_start - margin_sec)
+        end = min(audio_duration_sec, raw_end + margin_sec)
+
+        regions.append(
+            {
+                "index": i,
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "duration": round(end - start, 3),
+                "reason": "speaker_segment",
+                "speaker": seg["speaker"],
+                "source_start": raw_start,
+                "source_end": raw_end,
+                "source_duration": round(raw_end - raw_start, 3),
+            }
+        )
+
+    return regions
+
+def slice_audio_region_to_wav_bytes(audio, start_sec: float, end_sec: float) -> bytes:
+    start_ms = max(0, int(start_sec * 1000))
+    end_ms = min(len(audio), int(end_sec * 1000))
+    if end_ms <= start_ms:
+        return b""
+
+    chunk = audio[start_ms:end_ms]
+    buf = io.BytesIO()
+    chunk.export(buf, format="wav")
+    return buf.getvalue()
+
+def filter_transcript_by_time_range(
+    transcript: list[dict],
+    start_sec: float,
+    end_sec: float,
+) -> list[dict]:
+    results = []
+    for item in transcript:
+        overlap = calc_interval_overlap(
+            float(item["start"]),
+            float(item["end"]),
+            start_sec,
+            end_sec,
+        )
+        if overlap > 0:
+            results.append(item.copy())
+    return results
+
+
+def filter_speaker_segments_by_time_range(
+    speaker_segments: list[dict],
+    start_sec: float,
+    end_sec: float,
+) -> list[dict]:
+    results = []
+    for seg in speaker_segments:
+        overlap = calc_interval_overlap(
+            float(seg["start"]),
+            float(seg["end"]),
+            start_sec,
+            end_sec,
+        )
+        if overlap > 0:
+            results.append(seg.copy())
+    return results
+
+def build_transcript_from_kotoba_segments(segments: list[dict]) -> list[dict]:
+    transcript = []
+    for seg in segments or []:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+
+        transcript.append(
+            {
+                "speaker": "UNKNOWN",
+                "text": text,
+                "start": float(seg["start"]),
+                "end": float(seg["end"]),
+            }
+        )
+
+    transcript.sort(key=lambda x: (x["start"], x["end"]))
+    return transcript
+
+async def run_rescue_asr_for_regions(
+    audio,
+    rescue_regions: list[dict],
+    speaker_segments: list[dict], # 🌟 引数を追加
+    asr,
+    kotoba,
+    parallel_limit: int = 8,
+) -> list[dict]:
+    semaphore = asyncio.Semaphore(parallel_limit)
+
+    async def _run_one(region: dict):
+        start_sec = float(region["start"])
+        end_sec = float(region["end"])
+        
+        # ① Kotobaには、レスキュー区間「全体」を一塊で投げる (文脈と全体の骨格を取るため)
+        async def _run_kotoba():
+            async with semaphore:
+                wav_bytes = slice_audio_region_to_wav_bytes(audio, start_sec, end_sec)
+                if not wav_bytes:
+                    return None
+
+                res = await asyncio.to_thread(
+                    kotoba.transcribe_segment.remote,
+                    segment_data=wav_bytes,
+                    segment_start_sec=start_sec,
+                    segment_end_sec=end_sec,
+                    language="ja",
+                    task="transcribe",
+                )
+                return res
+        
+        kotoba_task = asyncio.create_task(_run_kotoba())
+
+        # ② Parakeetには、speaker_segments に従って「細かくスライス」して投げる
+        segs_in_region = filter_speaker_segments_by_time_range(speaker_segments, start_sec, end_sec)
+        if not segs_in_region:
+            segs_in_region = [{"start": start_sec, "end": end_sec, "speaker": "UNKNOWN"}]
+
+        async def _run_parakeet_seg(seg: dict):
+            async with semaphore:
+                s_start = max(start_sec, float(seg["start"]))
+                s_end = min(end_sec, float(seg["end"]))
+                
+                # 短すぎるノイズは無視
+                if s_end - s_start < 0.2:
+                    return []
+                    
+                wav_bytes = slice_audio_region_to_wav_bytes(audio, s_start, s_end)
+                if not wav_bytes:
+                    return []
+
+                res = await asyncio.to_thread(
+                    asr.transcribe_segment.remote,
+                    segment_data=wav_bytes,
+                    segment_start_sec=s_start,
+                    segment_end_sec=s_end,
+                )
+                return res.get("char_timestamps", [])
+
+        # 細切れにしたタスクを並列で一気に投げる！
+        parakeet_tasks = [asyncio.create_task(_run_parakeet_seg(s)) for s in segs_in_region]
+
+        # 両方の完了を待つ
+        rescue_kotoba_result = await kotoba_task
+        parakeet_char_results = await asyncio.gather(*parakeet_tasks)
+
+        # 細切れになった Parakeet の char_timestamps を1つに統合する
+        merged_parakeet_chars = []
+        for chars in parakeet_char_results:
+            merged_parakeet_chars.extend(chars)
+        merged_parakeet_chars.sort(key=lambda x: x["start"])
+
+        return {
+            "region": region,
+            "rescue_parakeet": {"char_timestamps": merged_parakeet_chars},
+            "rescue_kotoba": rescue_kotoba_result, # Kotobaは結果全体をそのまま渡す
+        }
+
+    return await asyncio.gather(*[_run_one(r) for r in rescue_regions])
+
+
+def transcript_to_plain_lines(transcript: list[dict]) -> str:
+    if not transcript:
+        return "(empty)"
+    return "\n".join(
+        f"[{format_seconds(float(item['start']))}] {item['speaker']}: {item['text']}"
+        for item in transcript
+    )
+
+
+def speaker_segments_to_plain_lines(segments: list[dict]) -> str:
+    if not segments:
+        return "(empty)"
+    return "\n".join(
+        f"[{format_seconds(float(seg['start']))} - {format_seconds(float(seg['end']))}] {seg['speaker']}"
+        for seg in segments
+    )
+
+def llm_compare_and_merge_region(
+    job_id: str,
+    region_result: dict,
+    base_transcript: list[dict],
+    speaker_segments: list[dict],
+) -> list[dict]:
+    from google import genai
+    from google.genai import types
+
+    region = region_result["region"]
+    start_sec = float(region["start"])
+    end_sec = float(region["end"])
+
+    primary_region_transcript = filter_transcript_by_time_range(
+        base_transcript,
+        start_sec,
+        end_sec,
+    )
+
+    rescue_parakeet_transcript = []
+    rescue_parakeet_result = region_result.get("rescue_parakeet")
+    if rescue_parakeet_result:
+        rescue_chars = rescue_parakeet_result.get("char_timestamps", [])
+        rescue_parakeet_transcript = merge_chars_and_speakers_with_late_fusion(
+            rescue_chars,
+            filter_speaker_segments_by_time_range(speaker_segments, start_sec, end_sec),
+        )
+        rescue_parakeet_transcript = merge_small_transcript_segments(rescue_parakeet_transcript)
+
+    rescue_kotoba_transcript = build_transcript_from_kotoba_segments(
+        (region_result.get("rescue_kotoba") or {}).get("segments", [])
+    )
+
+    region_speaker_segments = filter_speaker_segments_by_time_range(
+        speaker_segments,
+        start_sec,
+        end_sec,
+    )
+
+    prompt = COMPARE_AND_MERGE_PROMPT_TEMPLATE.format(
+        region_start=format_seconds(start_sec),
+        region_end=format_seconds(end_sec),
+        speaker_segments_text=speaker_segments_to_plain_lines(region_speaker_segments),
+        primary_text=transcript_to_plain_lines(primary_region_transcript),
+        rescue_parakeet_text=transcript_to_plain_lines(rescue_parakeet_transcript),
+        rescue_kotoba_text=transcript_to_plain_lines(rescue_kotoba_transcript),
+    )
+
+    client = genai.Client()
+    response = client.models.generate_content(
+        model=COMPARE_MERGE_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            system_instruction=(
+                "You are a careful transcript merger. "
+                "Prefer Parakeet wording, prefer diarization speaker order, "
+                "use Kotoba only as supporting evidence for turn presence and short-turn structure. "
+                "Do not invent missing content."
+            ),
+        ),
+    )
+
+    merged_text = response.text or ""
+
+    merged_transcript = parse_cleaned_transcript(
+        merged_text,
+        primary_region_transcript or rescue_parakeet_transcript or rescue_kotoba_transcript,
+    )
+
+    # rescue region の範囲に限定
+    merged_transcript = [
+        item for item in merged_transcript
+        if calc_interval_overlap(
+            float(item["start"]),
+            float(item["end"]),
+            start_sec,
+            end_sec,
+        ) > 0 or (start_sec <= float(item["start"]) <= end_sec)
+    ]
+
+    return merged_transcript
+
+def replace_regions_in_transcript(
+    base_transcript: list[dict],
+    rewritten_regions: list[dict],
+) -> list[dict]:
+    if not rewritten_regions:
+        return base_transcript
+
+    rewritten_regions = sorted(rewritten_regions, key=lambda x: x["start"])
+    result = []
+
+    for item in base_transcript:
+        item_start = float(item["start"])
+        item_end = float(item["end"])
+
+        overlaps_any = False
+        for region in rewritten_regions:
+            overlap = calc_interval_overlap(
+                item_start,
+                item_end,
+                float(region["start"]),
+                float(region["end"]),
+            )
+            if overlap > 0:
+                overlaps_any = True
+                break
+
+        if not overlaps_any:
+            result.append(item.copy())
+
+    for region in rewritten_regions:
+        for item in region["transcript"]:
+            result.append(item.copy())
+
+    result.sort(key=lambda x: (float(x["start"]), float(x["end"])))
+    return result
+
+async def run_compare_and_merge_for_regions(
+    job_id: str,
+    rescue_region_results: list[dict],
+    base_transcript: list[dict],
+    speaker_segments: list[dict],
+    parallel_limit: int = 4,
+) -> list[dict]:
+    semaphore = asyncio.Semaphore(parallel_limit)
+
+    async def _run_one(region_result: dict):
+        async with semaphore:
+            merged_region_transcript = await asyncio.to_thread(
+                llm_compare_and_merge_region,
+                job_id,
+                region_result,
+                base_transcript,
+                speaker_segments,
+            )
+
+            return {
+                "region": region_result["region"],
+                "merged_transcript": merged_region_transcript,
+            }
+
+    return await asyncio.gather(*[_run_one(r) for r in rescue_region_results])

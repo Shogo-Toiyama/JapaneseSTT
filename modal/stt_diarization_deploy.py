@@ -22,7 +22,7 @@ image = (
 
 @app.cls(
     image=image,
-    gpu="T4",
+    gpu="L4",
     timeout=3600,
     secrets=[modal.Secret.from_name("huggingface-secret")],
     scaledown_window=2,
@@ -49,34 +49,35 @@ class DiarizationService:
     def diarize(self, audio_data: bytes, num_speakers: int | None = None):
         import io
         import torch
-        import soundfile as sf
-        from pydub import AudioSegment
+        import torchaudio
+        import torchaudio.functional as F
 
-        audio = AudioSegment.from_file(io.BytesIO(audio_data))
-        audio = audio.set_frame_rate(16000).set_channels(1)
+        # 1回だけdecode
+        waveform, sample_rate = torchaudio.load(io.BytesIO(audio_data))
 
-        wav_buffer = io.BytesIO()
-        audio.export(wav_buffer, format="wav")
-        wav_buffer.seek(0)
+        # mono化
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
 
-        waveform_np, sample_rate = sf.read(wav_buffer, dtype="float32")
+        # 16kHz化
+        if sample_rate != 16000:
+            waveform = F.resample(waveform, sample_rate, 16000)
+            sample_rate = 16000
 
-        if waveform_np.ndim == 1:
-            waveform = torch.from_numpy(waveform_np).unsqueeze(0)
-        else:
-            waveform = torch.from_numpy(waveform_np).transpose(0, 1)
+        waveform = waveform.contiguous()
 
         kwargs = {}
         if num_speakers is not None:
             kwargs["num_speakers"] = num_speakers
 
-        result = self.pipeline(
-            {
-                "waveform": waveform,
-                "sample_rate": sample_rate,
-            },
-            **kwargs,
-        )
+        with torch.inference_mode():
+            result = self.pipeline(
+                {
+                    "waveform": waveform,
+                    "sample_rate": sample_rate,
+                },
+                **kwargs,
+            )
 
         annotation = getattr(result, "speaker_diarization", result)
 
@@ -90,7 +91,6 @@ class DiarizationService:
                 }
             )
 
-        # 4.x の speech activity / segmentation があれば使う。なければ話者区間を speech とみなす。
         speech_segments = []
         sad_like = getattr(result, "speech_activity", None) or getattr(result, "segmentation", None)
 
@@ -157,6 +157,7 @@ def smooth_speaker_segments(
             and seg["start"] - last["end"] <= max_gap_same_speaker
         ):
             last["end"] = max(last["end"], seg["end"])
+
         else:
             merged.append(seg.copy())
 

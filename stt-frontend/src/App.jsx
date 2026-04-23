@@ -9,9 +9,14 @@ function App() {
 
   const [statusPayload, setStatusPayload] = useState(null)
   const [debugData, setDebugData] = useState(null)
+
   const [selectedAsrChunk, setSelectedAsrChunk] = useState(0)
   const [selectedLlmInputChunk, setSelectedLlmInputChunk] = useState(0)
   const [selectedLlmOutputChunk, setSelectedLlmOutputChunk] = useState(0)
+
+  const [selectedRescueDetectionRegion, setSelectedRescueDetectionRegion] = useState(0)
+  const [selectedRescueAsrRegion, setSelectedRescueAsrRegion] = useState(0)
+  const [selectedCompareMergeRegion, setSelectedCompareMergeRegion] = useState(0)
 
   const debugTabs = useMemo(
     () => [
@@ -19,6 +24,9 @@ function App() {
       { key: 'asr', label: 'ASR' },
       { key: 'diarization', label: 'Diarization' },
       { key: 'fusion', label: 'Fusion' },
+      { key: 'rescueDetection', label: 'Rescue Detection' },
+      { key: 'rescueAsr', label: 'Rescue ASR' },
+      { key: 'compareMerge', label: 'Compare & Merge' },
       { key: 'llmInput', label: 'LLM Input' },
       { key: 'llmOutput', label: 'LLM Output' },
     ],
@@ -34,17 +42,40 @@ function App() {
     return `${minutes} 分 ${seconds.toFixed(1)} 秒`
   }
 
+  const formatTime = (sec) => {
+    if (sec == null || Number.isNaN(sec)) return '-'
+    const minutes = Math.floor(sec / 60)
+    const seconds = sec - minutes * 60
+    return `${String(minutes).padStart(2, '0')}:${seconds.toFixed(1).padStart(4, '0')}s`
+  }
+
   const safeJson = (value) => JSON.stringify(value ?? null, null, 2)
 
   const getAsrChunks = () => debugData?.asr?.chunks ?? []
+  const getCoverageIntervals = () => debugData?.asr?.coverage_intervals ?? []
   const getSpeakerSegments = () => debugData?.diarization?.speaker_segments ?? []
+  const getSpeechSegments = () => debugData?.diarization?.speech_segments ?? []
   const getFusionTranscript = () => debugData?.fusion?.transcript ?? []
   const getLlmInputs = () => debugData?.llm?.inputs ?? []
   const getLlmOutputs = () => debugData?.llm?.outputs ?? []
 
+  const getRescueDetectionRegions = () => debugData?.rescue_detection?.merged_regions ?? []
+  const getShortTurnRegions = () => debugData?.rescue_detection?.short_turn_regions ?? []
+  const getCoverageGapRegions = () => debugData?.rescue_detection?.coverage_gap_regions ?? []
+  const getFragmentRegions = () => debugData?.rescue_detection?.fragment_regions ?? []
+
+  const getRescueAsrRegions = () => debugData?.rescue_asr?.regions ?? []
+  const getCompareMergeRegions = () => debugData?.compare_merge?.regions ?? []
+
   const selectedAsrChunkData = getAsrChunks()[selectedAsrChunk] ?? null
   const selectedLlmInputData = getLlmInputs()[selectedLlmInputChunk] ?? null
   const selectedLlmOutputData = getLlmOutputs()[selectedLlmOutputChunk] ?? null
+  const selectedRescueDetectionRegionData =
+    getRescueDetectionRegions()[selectedRescueDetectionRegion] ?? null
+  const selectedRescueAsrRegionData =
+    getRescueAsrRegions()[selectedRescueAsrRegion] ?? null
+  const selectedCompareMergeRegionData =
+    getCompareMergeRegions()[selectedCompareMergeRegion] ?? null
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -61,16 +92,20 @@ function App() {
     setActiveTab('final')
     setStatusPayload(null)
     setDebugData(null)
+
     setSelectedAsrChunk(0)
     setSelectedLlmInputChunk(0)
     setSelectedLlmOutputChunk(0)
+    setSelectedRescueDetectionRegion(0)
+    setSelectedRescueAsrRegion(0)
+    setSelectedCompareMergeRegion(0)
 
     const formData = new FormData()
     formData.append('audio_file', file)
 
     try {
       const baseUrl =
-        'https://shogo-toiyama--transcription-orchestrator-kotoba-v1-fastapi-app.modal.run'
+        'https://shogo-toiyama--transcription-orchestrator-v1-fastapi-app.modal.run'
 
       const response = await fetch(`${baseUrl}/transcribe`, {
         method: 'POST',
@@ -183,7 +218,7 @@ function App() {
       <div style={{ padding: '16px' }}>{children}</div>
     </div>
   )
-  
+
   const CodeBlock = ({ value, maxHeight = 420 }) => (
     <pre
       style={{
@@ -206,7 +241,7 @@ function App() {
       {value}
     </pre>
   )
-  
+
   const SelectList = ({ items, selectedIndex, onSelect, renderLabel }) => (
     <div
       style={{
@@ -249,19 +284,13 @@ function App() {
       case 'final':
         return (
           <>
-            <Panel
-              title="Final Text"
-              subtitle="LLM整形後の最終テキスト"
-            >
+            <Panel title="Final Text" subtitle="LLM整形後の最終テキスト">
               <CodeBlock
-                value={
-                  result?.cleaned_text ||
-                  'cleaned_text はまだありません。'
-                }
+                value={result?.cleaned_text || 'cleaned_text はまだありません。'}
                 maxHeight={520}
               />
             </Panel>
-  
+
             <Panel
               title="Final Transcript JSON"
               subtitle={`items: ${result?.cleaned_transcript?.length ?? 0}`}
@@ -270,20 +299,24 @@ function App() {
             </Panel>
           </>
         )
-  
+
       case 'asr': {
         const asrChunks = getAsrChunks()
         const chunk = selectedAsrChunkData
-  
+
         return (
           <>
-            <Panel
-              title="ASR Summary"
-              subtitle="ASR chunkごとの結果と char_timestamps"
-            >
+            <Panel title="ASR Summary" subtitle="Parakeet の primary ASR 結果">
               <CodeBlock value={safeJson(debugData?.asr?.summary ?? {})} maxHeight={220} />
             </Panel>
-  
+
+            <Panel
+              title="Coverage Intervals"
+              subtitle={`intervals: ${getCoverageIntervals().length}`}
+            >
+              <CodeBlock value={safeJson(getCoverageIntervals())} maxHeight={220} />
+            </Panel>
+
             <div
               style={{
                 display: 'grid',
@@ -291,83 +324,69 @@ function App() {
                 gap: '16px',
               }}
             >
-              <Panel
-                title="ASR Chunks"
-                subtitle={`chunks: ${asrChunks.length}`}
-              >
+              <Panel title="ASR Chunks" subtitle={`chunks: ${asrChunks.length}`}>
                 <SelectList
                   items={asrChunks}
                   selectedIndex={selectedAsrChunk}
                   onSelect={setSelectedAsrChunk}
                   renderLabel={(item, index) =>
-                    `#${index} [${item?.start ?? '-'} - ${item?.end ?? '-'}] ${item?.speaker_id ?? 'UNKNOWN'} ${
-                      (item?.text ?? '').slice(0, 30) || '(empty)'
+                    `#${index} [${formatTime(item?.start)} - ${formatTime(item?.end)}] chars=${item?.char_count ?? 0} ${
+                      (item?.text ?? '').slice(0, 28) || '(empty)'
                     }`
                   }
                 />
               </Panel>
-  
+
               <div>
                 <Panel title="Selected ASR Chunk">
                   <CodeBlock value={safeJson(chunk)} maxHeight={220} />
                 </Panel>
-  
+
                 <Panel title="Selected ASR Text">
                   <CodeBlock value={chunk?.text || '(empty)'} maxHeight={180} />
                 </Panel>
-  
+
                 <Panel title="Selected ASR Char Timestamps">
-                  {Array.isArray(chunk?.char_timestamps) && chunk.char_timestamps.length > 0 ? (
-                    <CodeBlock value={safeJson(chunk.char_timestamps)} maxHeight={520} />
-                  ) : (
-                    <CodeBlock
-                      value={'Kotoba版では char_timestamps は現在出していません。raw_chunk を確認してください。'}
-                      maxHeight={160}
-                    />
-                  )}
-                </Panel>
-                <Panel title="Selected ASR Raw Chunk">
-                  <CodeBlock value={safeJson(chunk?.raw_chunk ?? null)} maxHeight={420} />
+                  <CodeBlock value={safeJson(chunk?.char_timestamps ?? [])} maxHeight={520} />
                 </Panel>
               </div>
             </div>
           </>
         )
       }
-  
+
       case 'diarization':
         return (
           <>
-            <Panel
-              title="Diarization Summary"
-              subtitle="話者分離結果の概要"
-            >
+            <Panel title="Diarization Summary" subtitle="話者分離結果の概要">
               <CodeBlock value={safeJson(debugData?.diarization?.summary ?? {})} maxHeight={220} />
             </Panel>
-  
-            <Panel
-              title="Speaker Segments"
-              subtitle={`segments: ${getSpeakerSegments().length}`}
-            >
-              <CodeBlock value={safeJson(getSpeakerSegments())} maxHeight={560} />
+
+            <Panel title="Turn Stats">
+              <CodeBlock value={safeJson(debugData?.diarization?.turn_stats ?? {})} maxHeight={220} />
+            </Panel>
+
+            <Panel title="Speaker Segments" subtitle={`segments: ${getSpeakerSegments().length}`}>
+              <CodeBlock value={safeJson(getSpeakerSegments())} maxHeight={360} />
+            </Panel>
+
+            <Panel title="Speech Segments" subtitle={`segments: ${getSpeechSegments().length}`}>
+              <CodeBlock value={safeJson(getSpeechSegments())} maxHeight={360} />
             </Panel>
           </>
         )
-  
+
       case 'fusion':
         return (
           <>
-            <Panel
-              title="Fusion Summary"
-              subtitle="ASR + speaker を結合した中間結果"
-            >
+            <Panel title="Fusion Summary" subtitle="ASR + speaker を結合した中間結果">
               <CodeBlock value={safeJson(debugData?.fusion?.summary ?? {})} maxHeight={220} />
             </Panel>
-  
+
             <Panel title="Fusion Plain Text">
               <CodeBlock value={debugData?.fusion?.plain_text || '(empty)'} maxHeight={420} />
             </Panel>
-  
+
             <Panel
               title="Fusion Transcript JSON"
               subtitle={`items: ${getFusionTranscript().length}`}
@@ -376,20 +395,32 @@ function App() {
             </Panel>
           </>
         )
-  
-      case 'llmInput': {
-        const llmInputs = getLlmInputs()
-        const input = selectedLlmInputData
-  
+
+      case 'rescueDetection': {
+        const merged = getRescueDetectionRegions()
+        const selected = selectedRescueDetectionRegionData
+
         return (
           <>
-            <Panel
-              title="LLM Input Summary"
-              subtitle="LLMに投げた Context / Target"
-            >
-              <CodeBlock value={safeJson(debugData?.llm?.summary ?? {})} maxHeight={220} />
+            <Panel title="Rescue Detection Summary" subtitle="救済対象区間の検出結果">
+              <CodeBlock
+                value={safeJson(debugData?.rescue_detection?.summary ?? {})}
+                maxHeight={220}
+              />
             </Panel>
-  
+
+            <Panel title="Short Turn Regions" subtitle={`count: ${getShortTurnRegions().length}`}>
+              <CodeBlock value={safeJson(getShortTurnRegions())} maxHeight={220} />
+            </Panel>
+
+            <Panel title="Coverage Gap Regions" subtitle={`count: ${getCoverageGapRegions().length}`}>
+              <CodeBlock value={safeJson(getCoverageGapRegions())} maxHeight={220} />
+            </Panel>
+
+            <Panel title="Fragment Regions" subtitle={`count: ${getFragmentRegions().length}`}>
+              <CodeBlock value={safeJson(getFragmentRegions())} maxHeight={220} />
+            </Panel>
+
             <div
               style={{
                 display: 'grid',
@@ -397,10 +428,137 @@ function App() {
                 gap: '16px',
               }}
             >
-              <Panel
-                title="LLM Input Chunks"
-                subtitle={`chunks: ${llmInputs.length}`}
-              >
+              <Panel title="Merged Rescue Regions" subtitle={`count: ${merged.length}`}>
+                <SelectList
+                  items={merged}
+                  selectedIndex={selectedRescueDetectionRegion}
+                  onSelect={setSelectedRescueDetectionRegion}
+                  renderLabel={(item, index) =>
+                    `#${index} [${formatTime(item?.start)} - ${formatTime(item?.end)}] ${
+                      (item?.reasons ?? []).join(', ') || 'region'
+                    }`
+                  }
+                />
+              </Panel>
+
+              <div>
+                <Panel title="Selected Rescue Region">
+                  <CodeBlock value={safeJson(selected)} maxHeight={320} />
+                </Panel>
+              </div>
+            </div>
+          </>
+        )
+      }
+
+      case 'rescueAsr': {
+        const regions = getRescueAsrRegions()
+        const selected = selectedRescueAsrRegionData
+
+        return (
+          <>
+            <Panel title="Rescue ASR Summary" subtitle="救済区間での Parakeet / Kotoba 再実行結果">
+              <CodeBlock value={safeJson(debugData?.rescue_asr?.summary ?? {})} maxHeight={220} />
+            </Panel>
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '320px 1fr',
+                gap: '16px',
+              }}
+            >
+              <Panel title="Rescue Regions" subtitle={`count: ${regions.length}`}>
+                <SelectList
+                  items={regions}
+                  selectedIndex={selectedRescueAsrRegion}
+                  onSelect={setSelectedRescueAsrRegion}
+                  renderLabel={(item, index) =>
+                    `#${index} [${formatTime(item?.region?.start)} - ${formatTime(item?.region?.end)}] ${
+                      (item?.region?.reasons ?? []).join(', ') || 'region'
+                    }`
+                  }
+                />
+              </Panel>
+
+              <div>
+                <Panel title="Selected Region">
+                  <CodeBlock value={safeJson(selected?.region ?? null)} maxHeight={220} />
+                </Panel>
+
+                <Panel title="Rescue Parakeet Result">
+                  <CodeBlock value={safeJson(selected?.rescue_parakeet ?? null)} maxHeight={320} />
+                </Panel>
+
+                <Panel title="Rescue Kotoba Result">
+                  <CodeBlock value={safeJson(selected?.rescue_kotoba ?? null)} maxHeight={320} />
+                </Panel>
+              </div>
+            </div>
+          </>
+        )
+      }
+
+      case 'compareMerge': {
+        const regions = getCompareMergeRegions()
+        const selected = selectedCompareMergeRegionData
+
+        return (
+          <>
+            <Panel title="Compare & Merge Summary" subtitle="rescue 区間ごとの統合結果">
+              <CodeBlock value={safeJson(debugData?.compare_merge?.summary ?? {})} maxHeight={220} />
+            </Panel>
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '320px 1fr',
+                gap: '16px',
+              }}
+            >
+              <Panel title="Compare & Merge Regions" subtitle={`count: ${regions.length}`}>
+                <SelectList
+                  items={regions}
+                  selectedIndex={selectedCompareMergeRegion}
+                  onSelect={setSelectedCompareMergeRegion}
+                  renderLabel={(item, index) =>
+                    `#${index} [${formatTime(item?.region?.start)} - ${formatTime(item?.region?.end)}]`
+                  }
+                />
+              </Panel>
+
+              <div>
+                <Panel title="Selected Region">
+                  <CodeBlock value={safeJson(selected?.region ?? null)} maxHeight={220} />
+                </Panel>
+
+                <Panel title="Merged Transcript">
+                  <CodeBlock value={safeJson(selected?.merged_transcript ?? [])} maxHeight={520} />
+                </Panel>
+              </div>
+            </div>
+          </>
+        )
+      }
+
+      case 'llmInput': {
+        const llmInputs = getLlmInputs()
+        const input = selectedLlmInputData
+
+        return (
+          <>
+            <Panel title="LLM Input Summary" subtitle="LLMに投げた Context / Target">
+              <CodeBlock value={safeJson(debugData?.llm?.summary ?? {})} maxHeight={220} />
+            </Panel>
+
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '320px 1fr',
+                gap: '16px',
+              }}
+            >
+              <Panel title="LLM Input Chunks" subtitle={`chunks: ${llmInputs.length}`}>
                 <SelectList
                   items={llmInputs}
                   selectedIndex={selectedLlmInputChunk}
@@ -410,16 +568,16 @@ function App() {
                   }
                 />
               </Panel>
-  
+
               <div>
                 <Panel title="Selected Input Metadata">
                   <CodeBlock value={safeJson(input)} maxHeight={220} />
                 </Panel>
-  
+
                 <Panel title="Context Lines">
                   <CodeBlock value={(input?.context_lines ?? []).join('\n')} maxHeight={220} />
                 </Panel>
-  
+
                 <Panel title="Target Lines">
                   <CodeBlock value={(input?.target_lines ?? []).join('\n')} maxHeight={420} />
                 </Panel>
@@ -428,20 +586,17 @@ function App() {
           </>
         )
       }
-  
+
       case 'llmOutput': {
         const llmOutputs = getLlmOutputs()
         const output = selectedLlmOutputData
-  
+
         return (
           <>
-            <Panel
-              title="LLM Output Summary"
-              subtitle="LLMから返ってきた chunk ごとの生テキスト"
-            >
+            <Panel title="LLM Output Summary" subtitle="LLMから返ってきた chunk ごとの生テキスト">
               <CodeBlock value={safeJson(debugData?.llm?.summary ?? {})} maxHeight={220} />
             </Panel>
-  
+
             <div
               style={{
                 display: 'grid',
@@ -449,10 +604,7 @@ function App() {
                 gap: '16px',
               }}
             >
-              <Panel
-                title="LLM Output Chunks"
-                subtitle={`chunks: ${llmOutputs.length}`}
-              >
+              <Panel title="LLM Output Chunks" subtitle={`chunks: ${llmOutputs.length}`}>
                 <SelectList
                   items={llmOutputs}
                   selectedIndex={selectedLlmOutputChunk}
@@ -462,12 +614,12 @@ function App() {
                   }
                 />
               </Panel>
-  
+
               <div>
                 <Panel title="Selected Output Metadata">
                   <CodeBlock value={safeJson(output)} maxHeight={220} />
                 </Panel>
-  
+
                 <Panel title="Selected Output Raw Text">
                   <CodeBlock value={output?.raw_text || '(empty)'} maxHeight={520} />
                 </Panel>
@@ -476,7 +628,7 @@ function App() {
           </>
         )
       }
-  
+
       default:
         return null
     }
@@ -485,7 +637,7 @@ function App() {
   return (
     <div
       style={{
-        maxWidth: '960px',
+        maxWidth: '1200px',
         margin: '40px auto',
         fontFamily: 'sans-serif',
         padding: '0 20px',
@@ -622,7 +774,7 @@ function App() {
           >
             <h2 style={{ margin: 0, fontSize: '18px' }}>Debug Viewer</h2>
             <p style={{ margin: '6px 0 0', color: '#666', fontSize: '14px' }}>
-              ASR / Diarization / Fusion / LLM の中間結果を確認できます。
+              ASR / Diarization / Fusion / Rescue / Compare & Merge / LLM の中間結果を確認できます。
             </p>
           </div>
 
@@ -672,10 +824,12 @@ function App() {
           >
             <div>status: {statusPayload?.status ?? '-'}</div>
             <div>ASR chunks: {debugData?.asr?.summary?.chunk_count ?? 0}</div>
-            <div>
-              speaker segments: {debugData?.diarization?.summary?.speaker_segment_count ?? 0}
-            </div>
+            <div>speaker segments: {debugData?.diarization?.summary?.speaker_segment_count ?? 0}</div>
+            <div>speech segments: {debugData?.diarization?.summary?.speech_segment_count ?? 0}</div>
             <div>fusion items: {debugData?.fusion?.summary?.transcript_items ?? 0}</div>
+            <div>rescue regions: {debugData?.rescue_detection?.summary?.merged_region_count ?? 0}</div>
+            <div>rescue ASR: {debugData?.rescue_asr?.summary?.region_count ?? 0}</div>
+            <div>compare merge: {debugData?.compare_merge?.summary?.region_count ?? 0}</div>
             <div>LLM inputs: {debugData?.llm?.summary?.input_chunk_count ?? 0}</div>
             <div>LLM outputs: {debugData?.llm?.summary?.output_chunk_count ?? 0}</div>
           </div>
